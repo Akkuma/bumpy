@@ -203,16 +203,35 @@ describe('registry version lookup', () => {
 
   test('flags unresolved when neither `latest` nor the hint resolve', async () => {
     addMockRule(NO_LATEST);
-    addMockRule({ match: '--tag alpha', error: 'No match found for version alpha' });
-    expect(await fetchPublishedVersions('pkg', { tag: 'alpha' })).toEqual({ versions: [], unresolved: true });
+    addMockRule({ match: '--tag alpha', error: 'npm error code E404\nNo match found for version alpha' });
+    expect(await fetchPublishedVersions('pkg', { tag: 'alpha' })).toEqual({ versions: [], unresolved: 'no-dist-tag' });
     resetMockState();
     addMockRule(NO_LATEST);
-    expect(await fetchPublishedVersions('pkg')).toEqual({ versions: [], unresolved: true });
+    expect(await fetchPublishedVersions('pkg')).toEqual({ versions: [], unresolved: 'no-dist-tag' });
   });
 
   test('a missing package is not unresolved', async () => {
-    addMockRule({ match: 'npm info pkg versions', error: 'E404 Not Found' });
+    addMockRule({ match: 'npm info pkg versions', error: 'npm error code E404\nnpm error 404 Not Found' });
     expect(await fetchPublishedVersions('pkg', { tag: 'alpha' })).toEqual({ versions: [], unresolved: false });
+  });
+
+  test('flags lookup-failed for non-404 failures', async () => {
+    addMockRule({ match: 'npm info pkg versions', error: 'npm error code E401\nnpm error Unable to authenticate' });
+    expect(await fetchPublishedVersions('pkg', { tag: 'alpha' })).toEqual({
+      versions: [],
+      unresolved: 'lookup-failed',
+    });
+    resetMockState();
+    addMockRule({ match: 'npm info pkg versions', response: '<html>bad gateway</html>' });
+    expect(await fetchPublishedVersions('pkg')).toEqual({ versions: [], unresolved: 'lookup-failed' });
+    // the dist-tag fallback failing for a non-404 reason is a lookup failure too
+    resetMockState();
+    addMockRule(NO_LATEST);
+    addMockRule({ match: '--tag alpha', error: 'npm error code ETIMEDOUT' });
+    expect(await fetchPublishedVersions('pkg', { tag: 'alpha' })).toEqual({
+      versions: [],
+      unresolved: 'lookup-failed',
+    });
   });
 
   test('isVersionOnRegistry checks the exact version', async () => {
@@ -245,13 +264,20 @@ describe('registry version lookup', () => {
 
     test('warns when the version list cannot be read', async () => {
       addMockRule(NO_LATEST);
-      addMockRule({ match: '--tag alpha', error: 'No match found for version alpha' });
+      addMockRule({ match: '--tag alpha', error: 'npm error code E404\nNo match found for version alpha' });
       const { plan: out, warnings } = await buildChannelReleasePlan(plan, channel, packages, process.cwd(), {
         forDisplay: true,
       });
       expect(out.releases[0]!.newVersion).toBe('0.1.0-alpha.0');
       expect(warnings).toHaveLength(1);
       expect(warnings[0]).toContain('neither a "latest" nor a "alpha" dist-tag');
+    });
+
+    test('warns when the registry lookup fails', async () => {
+      addMockRule({ match: 'npm info pkg versions', error: 'npm error code E500' });
+      const { warnings } = await buildChannelReleasePlan(plan, channel, packages, process.cwd(), { forDisplay: true });
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('could not be looked up on the registry');
     });
   });
 });
