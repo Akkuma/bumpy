@@ -5,16 +5,8 @@ import { loadConfig, loadPackageConfig, getBumpyDir, matchGlob, resolveFixedGrou
 import { discoverWorkspace } from '../core/workspace.ts';
 import { readBumpFiles, filterBranchBumpFiles } from '../core/bump-file.ts';
 import { getChangedFiles, getFileStatuses, getBaseCompareRef, readFileAtRef } from '../core/git.ts';
-import {
-  detectPackageManager,
-  parseCatalogs,
-  diffCatalogMaps,
-  isCatalogRefAffected,
-  catalogYamlFile,
-  CATALOG_FILES,
-} from '../utils/package-manager.ts';
+import { getChangedCatalogEntries, findCatalogConsumers, touchesCatalogFiles } from '../core/catalog-changes.ts';
 import { readText, exists } from '../utils/fs.ts';
-import { DEP_TYPES } from '../types.ts';
 import type { BumpyConfig, WorkspacePackage } from '../types.ts';
 
 export type HookContext = 'pre-commit' | 'pre-push';
@@ -347,23 +339,10 @@ export async function findChangedPackages(
 
   // Catalog change detection: if a catalog file changed, find packages whose
   // catalog: dep references resolve to a changed catalog entry
-  const catalogChanges = await getChangedCatalogEntries(rootDir, compareBranch, changedFiles);
-  if (catalogChanges.size > 0) {
-    for (const [name, pkg] of packages) {
-      if (changed.has(name)) continue;
-      for (const depType of DEP_TYPES) {
-        const deps = pkg[depType];
-        let matched = false;
-        for (const [depName, range] of Object.entries(deps)) {
-          if (isCatalogRefAffected(range, depName, catalogChanges)) {
-            changed.add(name);
-            matched = true;
-            break;
-          }
-        }
-        if (matched) break;
-      }
-    }
+  if (touchesCatalogFiles(changedFiles)) {
+    baseRef ??= getBaseCompareRef(rootDir, compareBranch);
+    const catalogChanges = await getChangedCatalogEntries(rootDir, baseRef, null, changedFiles);
+    for (const name of findCatalogConsumers(packages, catalogChanges)) changed.add(name);
   }
 
   return [...changed];
@@ -453,40 +432,4 @@ function deepEqual(a: unknown, b: unknown): boolean {
   const bk = Object.keys(bo);
   if (ak.length !== bk.length) return false;
   return ak.every((k) => Object.prototype.hasOwnProperty.call(bo, k) && deepEqual(ao[k], bo[k]));
-}
-
-/**
- * Compute which catalog entries changed between the base ref and HEAD.
- * Returns Map<catalogName, Set<depName>>. Empty if no catalog files changed.
- */
-async function getChangedCatalogEntries(
-  rootDir: string,
-  baseBranch: string,
-  changedFiles: string[],
-): Promise<Map<string, Set<string>>> {
-  const catalogFileChanged = changedFiles.some((f) => (CATALOG_FILES as readonly string[]).includes(f));
-  if (!catalogFileChanged) return new Map();
-
-  const baseRef = getBaseCompareRef(rootDir, baseBranch);
-
-  const pm = await detectPackageManager(rootDir);
-
-  // The workspace YAML that may hold catalogs: pnpm-workspace.yaml for pnpm,
-  // .yarnrc.yml for Yarn, and none for npm/bun (which use package.json).
-  const yamlFile = catalogYamlFile(pm);
-
-  // Load "after" (current working tree state)
-  const afterYaml =
-    yamlFile && (await exists(resolve(rootDir, yamlFile))) ? await readText(resolve(rootDir, yamlFile)) : null;
-  const afterPkgJson = (await exists(resolve(rootDir, 'package.json')))
-    ? await readText(resolve(rootDir, 'package.json'))
-    : null;
-  const afterCatalogs = parseCatalogs(afterYaml, afterPkgJson);
-
-  // Load "before" (state at base ref).
-  const beforeYaml = yamlFile ? readFileAtRef(rootDir, baseRef, yamlFile) : null;
-  const beforePkgJson = readFileAtRef(rootDir, baseRef, 'package.json');
-  const beforeCatalogs = parseCatalogs(beforeYaml, beforePkgJson);
-
-  return diffCatalogMaps(beforeCatalogs, afterCatalogs);
 }

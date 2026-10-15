@@ -175,6 +175,7 @@ bumpy generate --deps          # one patch bump file per package whose dependenc
    - `fix:`, `perf:`, `refactor:`, `docs:`, `style:`, `test:`, `build:`, `ci:`, `chore:` → patch
    - `feat!:` or `BREAKING CHANGE:` → major
 2. **All other commits** (including scopeless conventional commits) are mapped to packages by detecting which files changed in the commit and matching them to package directories. These default to `patch`.
+   - If the commit changes a **catalog entry** (in `pnpm-workspace.yaml`, `.yarnrc.yml`, or the root `package.json`), every package that references that entry via `catalog:` is included — so a Renovate/Dependabot catalog bump maps to its consumers, matching what `bumpy check` requires.
 
 When multiple commits affect the same package, the highest bump level wins.
 
