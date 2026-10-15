@@ -833,8 +833,9 @@ async function packageExistsOnNpm(name: string, registry?: string): Promise<bool
   const args = ['npm', 'info', name, 'name'];
   if (registry) args.push('--registry', registry);
   try {
-    const result = await runArgsAsync(args);
-    return result.trim() === name;
+    // Exit 0 means the package exists — output can be empty when it has no `latest` dist-tag
+    await runArgsAsync(args);
+    return true;
   } catch {
     return false;
   }

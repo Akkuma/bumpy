@@ -20,6 +20,8 @@ export interface PublishedPrereleaseState {
   counters: number[];
   /** Whether the stable target version itself is already published */
   stablePublished: boolean;
+  /** Why the registry's version list couldn't be read, if it couldn't (see `PublishedVersions.unresolved`) */
+  unresolved?: PublishedVersions['unresolved'];
 }
 
 /**
@@ -47,19 +49,80 @@ export function nextPrereleaseVersion(target: string, preid: string, existingCou
   return `${target}-${preid}.${next}`;
 }
 
-/** Fetch all published versions of a package from the registry */
-export async function fetchPublishedVersions(name: string, registry?: string): Promise<string[]> {
+/** Published versions of a package, as listed by the registry */
+export interface PublishedVersions {
+  versions: string[];
+  /**
+   * Why the version list couldn't be read (`versions` is empty, but not because nothing is published):
+   * - `no-dist-tag` — the package exists, but `npm info <name>` resolves through a dist-tag
+   *   (`latest` by default) and prints nothing when it's missing, which happens on registries
+   *   that only set the tag you publish with (e.g. GCP Artifact Registry)
+   * - `lookup-failed` — the registry query failed for a reason other than "not found"
+   *   (auth, network, 5xx, malformed response)
+   */
+  unresolved: false | 'no-dist-tag' | 'lookup-failed';
+}
+
+type VersionsQueryResult = string[] | 'empty' | 'not-found' | 'failed';
+
+/**
+ * Run `npm info <name> versions --json`. `empty` means npm printed nothing (the dist-tag it
+ * resolved through doesn't exist); `not-found` is an E404 (no such package, or a non-`latest`
+ * tag with no match); `failed` is anything else.
+ */
+async function queryVersions(name: string, registry?: string, tag?: string): Promise<VersionsQueryResult> {
   const args = ['npm', 'info', name, 'versions', '--json'];
+  if (tag) args.push('--tag', tag);
   if (registry) args.push('--registry', registry);
+  let raw: string;
   try {
-    const raw = await runArgsAsync(args);
+    raw = await runArgsAsync(args);
+  } catch (err) {
+    return /\bE404\b/.test(err instanceof Error ? err.message : String(err)) ? 'not-found' : 'failed';
+  }
+  if (!raw.trim()) return 'empty';
+  try {
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed)) return parsed.filter((v) => typeof v === 'string');
     if (typeof parsed === 'string') return [parsed]; // single-version packages
-    return [];
+    return 'failed';
   } catch {
-    // Package doesn't exist yet (first prerelease ever) or registry unreachable
-    return [];
+    return 'failed';
+  }
+}
+
+/**
+ * Fetch all published versions of a package from the registry.
+ *
+ * Tries the default lookup (via `latest`) first, then falls back to `opts.tag` — the
+ * dist-tag bumpy publishes this release under — for packages that have no `latest`.
+ */
+export async function fetchPublishedVersions(
+  name: string,
+  opts: { registry?: string; tag?: string } = {},
+): Promise<PublishedVersions> {
+  const viaLatest = await queryVersions(name, opts.registry);
+  if (Array.isArray(viaLatest)) return { versions: viaLatest, unresolved: false };
+  // Package doesn't exist yet (first publish ever)
+  if (viaLatest === 'not-found') return { versions: [], unresolved: false };
+  if (viaLatest === 'failed') return { versions: [], unresolved: 'lookup-failed' };
+
+  if (opts.tag && opts.tag !== 'latest') {
+    const viaTag = await queryVersions(name, opts.registry, opts.tag);
+    if (Array.isArray(viaTag)) return { versions: viaTag, unresolved: false };
+    if (viaTag === 'failed') return { versions: [], unresolved: 'lookup-failed' };
+  }
+  return { versions: [], unresolved: 'no-dist-tag' };
+}
+
+/** Whether an exact version of a package is on the registry (no dist-tag resolution involved) */
+export async function isVersionOnRegistry(name: string, version: string, registry?: string): Promise<boolean> {
+  const args = ['npm', 'info', `${name}@${version}`, 'version'];
+  if (registry) args.push('--registry', registry);
+  try {
+    return (await runArgsAsync(args)).trim() === version;
+  } catch {
+    return false;
   }
 }
 
@@ -87,12 +150,17 @@ export async function getPublishedPrereleaseState(
   target: string,
   preid: string,
   rootDir: string,
+  distTag?: string,
 ): Promise<PublishedPrereleaseState> {
   if (usesNpmRegistry(pkg)) {
-    const versions = await fetchPublishedVersions(pkg.name, pkg.bumpy?.registry);
+    const { versions, unresolved } = await fetchPublishedVersions(pkg.name, {
+      registry: pkg.bumpy?.registry,
+      tag: distTag,
+    });
     return {
       counters: extractPrereleaseCounters(versions, target, preid),
       stablePublished: versions.includes(target),
+      unresolved,
     };
   }
   // Non-npm packages (custom publish command / skipNpmPublish) — derive from git tags,
@@ -150,7 +218,18 @@ export async function buildChannelReleasePlan(
       if (pkg.private && !pkg.bumpy?.publishCommand) return;
 
       const target = release.newVersion; // stable target from the bump files
-      const state = await getPublishedPrereleaseState(pkg, target, channel.preid, rootDir);
+      const state = await getPublishedPrereleaseState(pkg, target, channel.preid, rootDir, channel.tag);
+
+      if (state.unresolved) {
+        const reason =
+          state.unresolved === 'no-dist-tag'
+            ? `exists on the registry but has neither a "latest" nor a "${channel.tag}" dist-tag`
+            : 'could not be looked up on the registry';
+        warnings.push(
+          `${release.name} ${reason}, so its published versions couldn't be listed — ` +
+            `the prerelease counter starts at 0 and may collide.`,
+        );
+      }
 
       if (state.stablePublished) {
         warnings.push(
