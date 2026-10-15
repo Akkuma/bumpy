@@ -110,6 +110,34 @@ describe('mapCommitToPackages — catalog changes', () => {
     expect(await mapCommitToPackages(hash, packages, tmpDir)).toEqual(['app']);
   });
 
+  test('a catalog commit from before a package-manager migration is still detected', async () => {
+    // pnpm repo: catalog bump commit…
+    await writeJson('package.json', { name: 'root', private: true });
+    await writeFileAt('pnpm-workspace.yaml', "packages:\n  - 'packages/*'\ncatalog:\n  react: ^18.2.0\n");
+    await writeFileAt('pnpm-lock.yaml', '');
+    await writeJson('packages/foo/package.json', {
+      name: 'foo',
+      version: '1.0.0',
+      dependencies: { react: 'catalog:' },
+    });
+    gitInDir(['add', '.'], tmpDir);
+    gitInDir(['commit', '-m', 'init monorepo'], tmpDir);
+    await writeFileAt('pnpm-workspace.yaml', "packages:\n  - 'packages/*'\ncatalog:\n  react: ^18.3.1\n");
+    gitInDir(['commit', '-am', 'bump react catalog entry'], tmpDir);
+    const catalogCommit = gitInDir(['rev-parse', 'HEAD'], tmpDir);
+
+    // …then a later commit migrates the repo to Yarn, moving the catalog to .yarnrc.yml
+    gitInDir(['rm', '-q', 'pnpm-workspace.yaml', 'pnpm-lock.yaml'], tmpDir);
+    await writeFileAt('yarn.lock', '');
+    await writeFileAt('.yarnrc.yml', 'catalog:\n  react: ^18.3.1\n');
+    await writeJson('package.json', { name: 'root', private: true, workspaces: ['packages/*'] });
+    gitInDir(['add', '.'], tmpDir);
+    gitInDir(['commit', '-m', 'migrate to yarn'], tmpDir);
+
+    const { packages } = await discoverWorkspace(tmpDir, await loadConfig(tmpDir));
+    expect(await mapCommitToPackages(catalogCommit, packages, tmpDir)).toEqual(['foo']);
+  });
+
   test('a root-level commit that changes no catalog entries maps to nothing', async () => {
     await writeJson('package.json', { name: 'root', private: true });
     await writeFileAt('pnpm-workspace.yaml', "packages:\n  - 'packages/*'\ncatalog:\n  react: ^18.2.0\n");

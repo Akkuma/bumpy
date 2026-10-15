@@ -3,7 +3,7 @@ import { readFileAtRef } from './git.ts';
 import {
   CATALOG_FILES,
   catalogYamlFile,
-  detectPackageManager,
+  detectPackageManagerFrom,
   diffCatalogMaps,
   isCatalogRefAffected,
   parseCatalogs,
@@ -31,20 +31,17 @@ export function touchesCatalogFiles(changedFiles: string[]): boolean {
   return changedFiles.some((f) => (CATALOG_FILES as readonly string[]).includes(f));
 }
 
-/** Load catalog definitions at a git ref, or from the working tree when `ref` is null */
+/**
+ * Load catalog definitions at a git ref, or from the working tree when `ref` is null.
+ * The package manager (and so the YAML file that may hold catalogs: pnpm-workspace.yaml
+ * for pnpm, .yarnrc.yml for Yarn, none for npm/bun) is detected at that same ref, so a
+ * catalog commit from before a package-manager migration is still read correctly.
+ */
 export async function loadCatalogsAt(rootDir: string, ref: string | null): Promise<CatalogMap> {
-  const pm = await detectPackageManager(rootDir);
-  // The workspace YAML that may hold catalogs: pnpm-workspace.yaml for pnpm,
-  // .yarnrc.yml for Yarn, and none for npm/bun (which use package.json).
-  const yamlFile = catalogYamlFile(pm);
-  if (ref) {
-    return parseCatalogs(
-      yamlFile ? readFileAtRef(rootDir, ref, yamlFile) : null,
-      readFileAtRef(rootDir, ref, 'package.json'),
-    );
-  }
-  const read = async (file: string) =>
-    (await exists(resolve(rootDir, file))) ? readText(resolve(rootDir, file)) : null;
+  const read = ref
+    ? async (file: string) => readFileAtRef(rootDir, ref, file)
+    : async (file: string) => ((await exists(resolve(rootDir, file))) ? readText(resolve(rootDir, file)) : null);
+  const yamlFile = catalogYamlFile(await detectPackageManagerFrom(read));
   return parseCatalogs(yamlFile ? await read(yamlFile) : null, await read('package.json'));
 }
 
