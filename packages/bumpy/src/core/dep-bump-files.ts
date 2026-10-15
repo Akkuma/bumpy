@@ -4,9 +4,10 @@ import { relative, resolve } from 'node:path';
 import { getBumpyDir, matchGlob, resolveFixedGroups } from './config.ts';
 import { writeBumpFile } from './bump-file.ts';
 import { readFileAtRef } from './git.ts';
-import { catalogYamlFile, detectPackageManager, parseCatalogs, resolveCatalogDep } from '../utils/package-manager.ts';
+import { resolveCatalogDep } from '../utils/package-manager.ts';
 import type { CatalogMap } from '../utils/package-manager.ts';
-import { ensureDir, exists, readText } from '../utils/fs.ts';
+import { loadCatalogsAt } from './catalog-changes.ts';
+import { ensureDir } from '../utils/fs.ts';
 import { slugify } from '../utils/names.ts';
 import { DEP_TYPES } from '../types.ts';
 import type { BumpyConfig, DepType, WorkspacePackage } from '../types.ts';
@@ -68,20 +69,6 @@ function isReleaseRelevantDep(depType: DepType, depName: string, pkg: WorkspaceP
 function resolveRange(depName: string, range: string | undefined, catalogs: CatalogMap): string | undefined {
   if (range === undefined) return undefined;
   return resolveCatalogDep(depName, range, catalogs) ?? range;
-}
-
-async function loadCatalogsAt(rootDir: string, ref: string | null): Promise<CatalogMap> {
-  const pm = await detectPackageManager(rootDir);
-  const yamlFile = catalogYamlFile(pm);
-  if (ref) {
-    return parseCatalogs(
-      yamlFile ? readFileAtRef(rootDir, ref, yamlFile) : null,
-      readFileAtRef(rootDir, ref, 'package.json'),
-    );
-  }
-  const read = async (file: string) =>
-    (await exists(resolve(rootDir, file))) ? readText(resolve(rootDir, file)) : null;
-  return parseCatalogs(yamlFile ? await read(yamlFile) : null, await read('package.json'));
 }
 
 /**

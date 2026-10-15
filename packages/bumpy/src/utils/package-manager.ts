@@ -21,19 +21,25 @@ export async function detectWorkspaces(rootDir: string): Promise<WorkspaceInfo> 
 }
 
 export async function detectPackageManager(rootDir: string): Promise<PackageManager> {
-  // Check lockfiles in priority order
-  if ((await exists(resolve(rootDir, 'bun.lock'))) || (await exists(resolve(rootDir, 'bun.lockb')))) {
-    return 'bun';
-  }
-  if (await exists(resolve(rootDir, 'pnpm-lock.yaml'))) {
-    return 'pnpm';
-  }
-  if (await exists(resolve(rootDir, 'yarn.lock'))) {
-    return 'yarn';
-  }
-  // Fallback: check packageManager field in package.json
+  return detectPackageManagerFrom(async (file) => {
+    const path = resolve(rootDir, file);
+    return (await exists(path)) ? readText(path) : null;
+  });
+}
+
+/**
+ * Package manager detection over an abstract file reader (`null` = file absent), so the
+ * same rules apply to the working tree and to a historical git ref. Lockfiles are checked
+ * in priority order, then the `packageManager` field in package.json, defaulting to npm.
+ */
+export async function detectPackageManagerFrom(
+  read: (file: string) => Promise<string | null>,
+): Promise<PackageManager> {
+  if ((await read('bun.lock')) != null || (await read('bun.lockb')) != null) return 'bun';
+  if ((await read('pnpm-lock.yaml')) != null) return 'pnpm';
+  if ((await read('yarn.lock')) != null) return 'yarn';
   try {
-    const pkg = await readJson<Record<string, unknown>>(resolve(rootDir, 'package.json'));
+    const pkg = JSON.parse((await read('package.json')) ?? '') as Record<string, unknown>;
     if (typeof pkg.packageManager === 'string') {
       const name = pkg.packageManager.split('@')[0];
       if (name === 'pnpm' || name === 'yarn' || name === 'bun') return name;

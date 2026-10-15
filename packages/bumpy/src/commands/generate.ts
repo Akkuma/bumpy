@@ -8,6 +8,7 @@ import { getBumpyDir } from '../core/config.ts';
 import { ensureDir } from '../utils/fs.ts';
 import { slugify, randomName } from '../utils/names.ts';
 import { getBaseCompareRef, getBranchCommits, getCurrentBranch, getFilesChangedInCommit } from '../core/git.ts';
+import { getChangedCatalogEntries, findCatalogConsumers } from '../core/catalog-changes.ts';
 import {
   detectDependencyChanges,
   planDependencyBumpFiles,
@@ -115,8 +116,7 @@ export async function generateCommand(rootDir: string, opts: GenerateOptions): P
 
       // CC commit but scope didn't resolve (or no scope) — use file-based detection
       // with the CC-derived bump level
-      const files = getFilesChangedInCommit(commit.hash, { cwd: rootDir });
-      const touchedPkgs = mapFilesToPackages(files, packages, rootDir).filter(isDirectlyBumpable);
+      const touchedPkgs = (await mapCommitToPackages(commit.hash, packages, rootDir)).filter(isDirectlyBumpable);
 
       if (touchedPkgs.length > 0) {
         for (const name of touchedPkgs) {
@@ -127,8 +127,7 @@ export async function generateCommand(rootDir: string, opts: GenerateOptions): P
       }
     } else {
       // Non-conventional commit — use file paths to detect packages, default to patch
-      const files = getFilesChangedInCommit(commit.hash, { cwd: rootDir });
-      const touchedPkgs = mapFilesToPackages(files, packages, rootDir).filter(isDirectlyBumpable);
+      const touchedPkgs = (await mapCommitToPackages(commit.hash, packages, rootDir)).filter(isDirectlyBumpable);
 
       if (touchedPkgs.length > 0) {
         fileBasedCount++;
@@ -243,6 +242,26 @@ function mergeRelease(
   } else {
     releaseMap.set(name, { type: bump, messages: [message] });
   }
+}
+
+/**
+ * Packages affected by a commit: those owning a changed file (directory containment),
+ * plus — when the commit touches a catalog file — every package with a `catalog:`
+ * dependency whose entry changed in that commit. Catalog files live at the repo root,
+ * so without the second pass a catalog-only bump (e.g. from Renovate) matches nothing.
+ */
+export async function mapCommitToPackages(
+  hash: string,
+  packages: Map<string, WorkspacePackage>,
+  rootDir: string,
+): Promise<string[]> {
+  const files = getFilesChangedInCommit(hash, { cwd: rootDir });
+  const matched = new Set(mapFilesToPackages(files, packages, rootDir));
+  // `hash^` doesn't exist for a root commit — readFileAtRef then yields no catalogs
+  // at "before", so every entry counts as added. That is the right answer.
+  const catalogChanges = await getChangedCatalogEntries(rootDir, `${hash}^`, hash, files);
+  for (const name of findCatalogConsumers(packages, catalogChanges)) matched.add(name);
+  return [...matched];
 }
 
 /** Map file paths to package names based on directory containment */
