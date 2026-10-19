@@ -201,6 +201,15 @@ export async function isVersionOnRegistry(
   return (await readExactField(name, version, 'version', opts)) === version;
 }
 
+/** Whether a package is on the registry at all; one with no `latest` dist-tag still exists */
+export async function packageExistsOnRegistry(
+  name: string,
+  opts: { registry?: string; manager?: PackageManager } = {},
+): Promise<boolean> {
+  const versions = await queryVersions(name, opts.registry, opts.manager ?? 'npm');
+  return Array.isArray(versions) || versions === 'empty';
+}
+
 /** Fetch the gitHead recorded for a published version (set by npm publish from a git checkout) */
 async function fetchGitHead(
   name: string,

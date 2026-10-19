@@ -325,8 +325,8 @@ describe('registry version lookup', () => {
       exists: false,
     },
   ])('$manager: packageExistsOnRegistry is $exists when $state', async ({ manager, rule, exists }) => {
-    addMockRule(rule);
     addMockRule({ match: /^(npm|pnpm|bun|yarn) /, error: 'unexpected registry command' });
+    addMockRule(rule);
     expect(await packageExistsOnRegistry('pkg', { manager })).toBe(exists);
     expect(getCallsMatching(rule.match)).toHaveLength(1);
   });

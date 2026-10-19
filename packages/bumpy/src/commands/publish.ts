@@ -8,7 +8,12 @@ import { publishPackages, willUseOidcExclusively } from '../core/publish-pipelin
 import { readBumpFiles } from '../core/bump-file.ts';
 import { assembleReleasePlan } from '../core/release-plan.ts';
 import { channelNames, resolveActiveChannel, type ResolvedChannel } from '../core/channels.ts';
-import { buildChannelReleasePlan, isVersionOnRegistry, writeTransientVersionsInPlace } from '../core/prerelease.ts';
+import {
+  buildChannelReleasePlan,
+  isVersionOnRegistry,
+  packageExistsOnRegistry,
+  writeTransientVersionsInPlace,
+} from '../core/prerelease.ts';
 import {
   buildSnapshotReleasePlan,
   resolveSnapshot,
@@ -38,7 +43,7 @@ import {
 import { loadFormatter } from '../core/changelog.ts';
 import { detectWorkspaces } from '../utils/package-manager.ts';
 import { CI_PLAN_CACHE_PATH } from './ci.ts';
-import { runArgsAsync, tryRunArgs } from '../utils/shell.ts';
+import { tryRunArgs } from '../utils/shell.ts';
 import type { BumpyConfig, PackageConfig, ReleasePlan, PlannedRelease, WorkspacePackage } from '../types.ts';
 import type { CatalogMap } from '../utils/package-manager.ts';
 import type { PackageManager } from '../types.ts';
@@ -410,7 +415,7 @@ async function runPublishFlow(
   // Only checks when OIDC is the only available auth (no token fallback), to avoid
   // false positives for users with id-token: write enabled solely for provenance.
   if (willUseOidcExclusively(rootDir)) {
-    const newPackages = await findPackagesMissingFromNpm(toPublish, packages);
+    const newPackages = await findPackagesMissingFromNpm(toPublish, packages, config.publish.publishManager);
     if (newPackages.length > 0) {
       const logFn = opts.dryRun ? log.warn : log.error;
       logFn(`Trusted publishing (OIDC) cannot create a new package. The following don't exist on npm yet:`);
@@ -828,28 +833,13 @@ async function checkIfPublished(
 }
 
 /**
- * Check whether a package exists on npm at all (any version).
- * Returns true if the package is registered, false if it doesn't exist or the query fails.
- */
-async function packageExistsOnNpm(name: string, registry?: string): Promise<boolean> {
-  const args = ['npm', 'info', name, 'name'];
-  if (registry) args.push('--registry', registry);
-  try {
-    // Exit 0 means the package exists — output can be empty when it has no `latest` dist-tag
-    await runArgsAsync(args);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Filter `toPublish` to package names that don't exist on npm yet.
  * Skips packages not going through the standard npm publish flow.
  */
 async function findPackagesMissingFromNpm(
   toPublish: PlannedRelease[],
   packages: Map<string, WorkspacePackage>,
+  manager: PackageManager,
 ): Promise<string[]> {
   const missing: string[] = [];
   await Promise.all(
@@ -858,7 +848,7 @@ async function findPackagesMissingFromNpm(
       const pkgConfig = pkg.bumpy || {};
       if (pkgConfig.publishCommand || pkgConfig.skipNpmPublish) return;
       if (pkg.private && !pkgConfig.publishCommand) return;
-      const exists = await packageExistsOnNpm(release.name, pkgConfig.registry);
+      const exists = await packageExistsOnRegistry(release.name, { registry: pkgConfig.registry, manager });
       if (!exists) missing.push(release.name);
     }),
   );
