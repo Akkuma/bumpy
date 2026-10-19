@@ -1,7 +1,7 @@
 import { isPrerelease } from 'verkit';
 import { tryRunArgs } from '../utils/shell.ts';
-import { isVersionOnRegistry, usesNpmRegistry, type PublishManager } from './prerelease.ts';
-import type { BumpyConfig, ReleasePlan, PlannedRelease, WorkspacePackage } from '../types.ts';
+import { isVersionOnRegistry, usesNpmRegistry } from './prerelease.ts';
+import type { BumpyConfig, PackageManager, ReleasePlan, PlannedRelease, WorkspacePackage } from '../types.ts';
 
 /**
  * Snapshot releases publish the pending release plan transiently — a throwaway
@@ -118,7 +118,7 @@ export async function buildSnapshotReleasePlan(
   stablePlan: ReleasePlan,
   snapshot: ResolvedSnapshot,
   packages: Map<string, WorkspacePackage>,
-  opts: { publishManager?: PublishManager } = {},
+  opts: { publishManager?: PackageManager } = {},
 ): Promise<SnapshotReleasePlanResult> {
   const warnings = [...stablePlan.warnings];
   const alreadyPublished: Array<{ name: string; version: string }> = [];

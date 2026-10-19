@@ -8,12 +8,7 @@ import { publishPackages, willUseOidcExclusively } from '../core/publish-pipelin
 import { readBumpFiles } from '../core/bump-file.ts';
 import { assembleReleasePlan } from '../core/release-plan.ts';
 import { channelNames, resolveActiveChannel, type ResolvedChannel } from '../core/channels.ts';
-import {
-  buildChannelReleasePlan,
-  isVersionOnRegistry,
-  writeTransientVersionsInPlace,
-  type PublishManager,
-} from '../core/prerelease.ts';
+import { buildChannelReleasePlan, isVersionOnRegistry, writeTransientVersionsInPlace } from '../core/prerelease.ts';
 import {
   buildSnapshotReleasePlan,
   resolveSnapshot,
@@ -807,7 +802,7 @@ export async function findUnpublishedPackages(
 async function checkIfPublished(
   name: string,
   version: string,
-  manager: PublishManager,
+  manager: PackageManager,
   pkgConfig?: PackageConfig,
 ): Promise<boolean> {
   const { runAsync, tryRunArgs } = await import('../utils/shell.ts');
