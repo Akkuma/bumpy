@@ -281,3 +281,130 @@ describe('registry version lookup', () => {
     });
   });
 });
+
+// The lookups run with `publish.publishManager`, so the registry is read with the same client
+// (and the same auth config) that publishes. Responses below are what each CLI printed against
+// a registry whose package only has an `alpha` dist-tag.
+describe('registry lookups use the publish manager', () => {
+  const channel = {
+    name: 'alpha',
+    branch: 'alpha',
+    preid: 'alpha',
+    tag: 'alpha',
+    versionPr: { title: 'Versioned prerelease (alpha)', branch: 'bumpy/release-alpha', automerge: false },
+  };
+  const plan = makeReleasePlan([makeRelease('pkg', '0.1.0', { oldVersion: '0.0.0' })]);
+  const packages = new Map([['pkg', makePkg('pkg', '0.0.0')]]);
+  const NPM_FORBIDDEN = { match: /^npm /, error: 'npm must not run when publishManager is not npm' };
+
+  beforeEach(() => resetMockState());
+  afterAll(() => uninstallShellMock());
+
+  const noLatest = [
+    {
+      manager: 'pnpm' as const,
+      rules: [
+        {
+          match: /^pnpm view pkg versions --json$/,
+          error: '{"error":{"code":"ERR_PNPM_PACKAGE_NOT_FOUND","message":"No matching version found for pkg@latest"}}',
+        },
+        { match: /^pnpm view pkg@alpha versions --json$/, response: '["0.1.0-alpha.0","0.1.0-alpha.1"]' },
+      ],
+    },
+    {
+      manager: 'bun' as const,
+      rules: [
+        {
+          match: /^bun info pkg versions --json$/,
+          error: '{ "error": "No matching version found", "version": "pkg" }',
+        },
+        { match: /^bun info pkg@alpha versions --json$/, response: '["0.1.0-alpha.0","0.1.0-alpha.1"]' },
+      ],
+    },
+    {
+      manager: 'yarn' as const,
+      rules: [
+        {
+          match: /^yarn npm info pkg --fields versions --json$/,
+          response: '{"name":"pkg","versions":["0.1.0-alpha.0","0.1.0-alpha.1"]}',
+        },
+      ],
+    },
+  ];
+
+  for (const { manager, rules } of noLatest) {
+    test(`${manager}: counts prereleases on a registry without \`latest\``, async () => {
+      addMockRule(NPM_FORBIDDEN);
+      for (const rule of rules) addMockRule(rule);
+      const { plan: out, warnings } = await buildChannelReleasePlan(plan, channel, packages, process.cwd(), {
+        forDisplay: true,
+        publishManager: manager,
+      });
+      expect(out.releases[0]!.newVersion).toBe('0.1.0-alpha.2');
+      expect(warnings).toEqual([]);
+      expect(getCallsMatching(/^npm /)).toHaveLength(0);
+    });
+  }
+
+  const missingPackage = [
+    {
+      manager: 'pnpm' as const,
+      error: '{"error":{"code":"ERR_PNPM_FETCH_404","message":"GET https://r/pkg: Not Found - 404"}}',
+    },
+    { manager: 'bun' as const, error: "404 Not Found: https://r/pkg\n - 'pkg@latest' does not exist in this registry" },
+    {
+      manager: 'yarn' as const,
+      error: '{"type":"error","name":35,"displayName":"YN0035","data":"  Response Code: 404 (Not Found)"}',
+    },
+  ];
+
+  for (const { manager, error } of missingPackage) {
+    test(`${manager}: a missing package is not unresolved`, async () => {
+      addMockRule(NPM_FORBIDDEN);
+      addMockRule({ match: /versions/, error });
+      expect(await fetchPublishedVersions('pkg', { tag: 'alpha', manager })).toEqual({
+        versions: [],
+        unresolved: false,
+      });
+    });
+  }
+
+  test('pnpm: a non-404 failure is lookup-failed', async () => {
+    addMockRule(NPM_FORBIDDEN);
+    addMockRule({ match: /versions/, error: '{"error":{"code":"ERR_PNPM_FETCH_401","message":"Unauthorized - 401"}}' });
+    expect(await fetchPublishedVersions('pkg', { tag: 'alpha', manager: 'pnpm' })).toEqual({
+      versions: [],
+      unresolved: 'lookup-failed',
+    });
+    expect(getCallsMatching(/^pnpm view pkg versions/)).toHaveLength(1);
+  });
+
+  // yarn answers a spec that matches nothing with the newest manifest instead of failing
+  test('yarn: an exact-version check rejects the manifest yarn substitutes', async () => {
+    addMockRule(NPM_FORBIDDEN);
+    addMockRule({
+      match: /^yarn npm info pkg@1\.0\.0 --fields version --json$/,
+      response: '{"name":"pkg","version":"1.0.0"}',
+    });
+    addMockRule({
+      match: /^yarn npm info pkg@9\.9\.9 --fields version --json$/,
+      response: '{"name":"pkg","version":"1.0.0"}',
+    });
+    expect(await isVersionOnRegistry('pkg', '1.0.0', { manager: 'yarn' })).toBe(true);
+    expect(await isVersionOnRegistry('pkg', '9.9.9', { manager: 'yarn' })).toBe(false);
+  });
+
+  test('pnpm: isVersionOnRegistry reads the exact version', async () => {
+    addMockRule(NPM_FORBIDDEN);
+    addMockRule({
+      match: /^pnpm view pkg@1\.0\.0 version --json --registry https:\/\/r\.example$/,
+      response: '"1.0.0"',
+    });
+    addMockRule({
+      match: /^pnpm view pkg@9\.9\.9 version --json/,
+      error: '{"error":{"code":"ERR_PNPM_PACKAGE_NOT_FOUND","message":"No matching version found for pkg@9.9.9"}}',
+    });
+    expect(await isVersionOnRegistry('pkg', '1.0.0', { registry: 'https://r.example', manager: 'pnpm' })).toBe(true);
+    expect(await isVersionOnRegistry('pkg', '9.9.9', { manager: 'pnpm' })).toBe(false);
+  });
+});
