@@ -91,14 +91,14 @@ To auto-commit locally, pass the `--commit` flag: `bumpy version --commit`. CI c
 
 The `publish` object controls how packages are packed and published:
 
-| Option               | Type                   | Default  | Description                                                                                             |
-| -------------------- | ---------------------- | -------- | ------------------------------------------------------------------------------------------------------- |
-| `packManager`        | `string`               | `"auto"` | Which package manager packs tarballs (`"auto"` detects from lockfile)                                   |
-| `publishManager`     | `string`               | `"npm"`  | Which tool runs `publish` and reads published versions from the registry (npm supports OIDC/provenance) |
-| `publishArgs`        | `string[]`             | `[]`     | Extra args passed to the publish command                                                                |
-| `protocolResolution` | `"pack" \| "in-place"` | `"pack"` | How `workspace:` and `catalog:` protocols are resolved                                                  |
-| `provenance`         | `boolean`              | `false`  | Attach provenance attestation via npm (requires OIDC CI environment)                                    |
-| `npmStaged`          | `boolean`              | `false`  | Use `npm stage publish` — requires 2FA approval on npmjs.com                                            |
+| Option               | Type                   | Default  | Description                                                           |
+| -------------------- | ---------------------- | -------- | --------------------------------------------------------------------- |
+| `packManager`        | `string`               | `"auto"` | Which package manager packs tarballs (`"auto"` detects from lockfile) |
+| `publishManager`     | `string`               | `"npm"`  | Which tool publishes and queries the registry (npm: OIDC/provenance)  |
+| `publishArgs`        | `string[]`             | `[]`     | Extra args passed to the publish command                              |
+| `protocolResolution` | `"pack" \| "in-place"` | `"pack"` | How `workspace:` and `catalog:` protocols are resolved                |
+| `provenance`         | `boolean`              | `false`  | Attach provenance attestation via npm (requires OIDC CI environment)  |
+| `npmStaged`          | `boolean`              | `false`  | Use `npm stage publish` — requires 2FA approval on npmjs.com          |
 
 #### Staged publishing
 
