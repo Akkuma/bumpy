@@ -118,7 +118,7 @@ const REGISTRY_READERS: Record<PackageManager, RegistryReader> = {
     ],
     // For a version that doesn't exist yarn prints the newest manifest instead of failing
     extract: (parsed, field, version) => {
-      if (typeof parsed !== 'object' || parsed === null) return undefined;
+      if (!parsed || typeof parsed !== 'object') return undefined;
       const manifest = parsed as Record<string, unknown>;
       if (version !== undefined && manifest.version !== version) return undefined;
       return manifest[field];
