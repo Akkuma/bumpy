@@ -4,7 +4,7 @@ import { readText, writeText, updateJsonFields, updateJsonNestedField } from '..
 import { runArgsAsync, tryRunArgs } from '../utils/shell.ts';
 import { listTags } from './git.ts';
 import type { ResolvedChannel } from './channels.ts';
-import type { ReleasePlan, PlannedRelease, WorkspacePackage } from '../types.ts';
+import type { ReleasePlan, PlannedRelease, PublishConfig, WorkspacePackage } from '../types.ts';
 
 /**
  * Prerelease versions are never committed to git — they are derived at publish time:
@@ -54,37 +54,99 @@ export interface PublishedVersions {
   versions: string[];
   /**
    * Why the version list couldn't be read (`versions` is empty, but not because nothing is published):
-   * - `no-dist-tag` — the package exists, but `npm info <name>` resolves through a dist-tag
-   *   (`latest` by default) and prints nothing when it's missing, which happens on registries
-   *   that only set the tag you publish with (e.g. GCP Artifact Registry)
+   * - `no-dist-tag` — the package exists, but the default lookup resolves through the `latest`
+   *   dist-tag and matches nothing when it's missing, which happens on registries that only set
+   *   the tag you publish with (e.g. GCP Artifact Registry)
    * - `lookup-failed` — the registry query failed for a reason other than "not found"
    *   (auth, network, 5xx, malformed response)
    */
   unresolved: false | 'no-dist-tag' | 'lookup-failed';
 }
 
-type VersionsQueryResult = string[] | 'empty' | 'not-found' | 'failed';
+export type PublishManager = PublishConfig['publishManager'];
 
 /**
- * Run `npm info <name> versions --json`. `empty` means npm printed nothing (the dist-tag it
- * resolved through doesn't exist); `not-found` is an E404 (no such package, or a non-`latest`
- * tag with no match); `failed` is anything else.
+ * Why a lookup returned no value: `not-found` means no such package, `empty` means the spec
+ * matched no version (e.g. the `latest` it resolved through doesn't exist), `failed` is anything else.
  */
-async function queryVersions(name: string, registry?: string, tag?: string): Promise<VersionsQueryResult> {
-  const args = ['npm', 'info', name, 'versions', '--json'];
-  if (tag) args.push('--tag', tag);
-  if (registry) args.push('--registry', registry);
+type LookupFailure = 'not-found' | 'empty' | 'failed';
+
+type ExactField = 'version' | 'gitHead';
+
+/** How one publish manager's CLI reads package metadata from the registry */
+interface RegistryReader {
+  versionsArgs: (spec: string, registry?: string) => string[];
+  fieldArgs: (spec: string, field: ExactField, registry?: string) => string[];
+  /** The field's value from the parsed output; `version` is the one an exact read asked for */
+  extract: (parsed: unknown, field: 'versions' | ExactField, version?: string) => unknown;
+  /** Classify a failed command by its error message */
+  classify: (message: string) => LookupFailure;
+}
+
+const registryFlag = (registry?: string) => (registry ? ['--registry', registry] : []);
+
+function infoCommandReader(command: string[], classify: RegistryReader['classify']): RegistryReader {
+  return {
+    versionsArgs: (spec, registry) => [...command, spec, 'versions', '--json', ...registryFlag(registry)],
+    fieldArgs: (spec, field, registry) => [...command, spec, field, '--json', ...registryFlag(registry)],
+    extract: (parsed) => parsed,
+    classify,
+  };
+}
+
+const REGISTRY_READERS: Record<PublishManager, RegistryReader> = {
+  npm: infoCommandReader(['npm', 'info'], (message) => (/\bE404\b/.test(message) ? 'not-found' : 'failed')),
+  pnpm: infoCommandReader(['pnpm', 'view'], (message) => {
+    if (message.includes('ERR_PNPM_FETCH_404')) return 'not-found';
+    if (message.includes('ERR_PNPM_PACKAGE_NOT_FOUND')) return 'empty';
+    return 'failed';
+  }),
+  bun: infoCommandReader(['bun', 'info'], (message) => {
+    if (message.includes('404 Not Found')) return 'not-found';
+    if (message.includes('No matching version found')) return 'empty';
+    return 'failed';
+  }),
+  // yarn has no --registry flag (it reads .yarnrc.yml) and wraps each field in the manifest
+  yarn: {
+    versionsArgs: (spec) => ['yarn', 'npm', 'info', spec, '--fields', 'versions', '--json'],
+    fieldArgs: (spec, field) => [
+      'yarn',
+      'npm',
+      'info',
+      spec,
+      '--fields',
+      field === 'version' ? 'version' : `version,${field}`,
+      '--json',
+    ],
+    // For a version that doesn't exist yarn prints the newest manifest instead of failing
+    extract: (parsed, field, version) => {
+      if (typeof parsed !== 'object' || parsed === null) return undefined;
+      const manifest = new Map(Object.entries(parsed));
+      if (version !== undefined && manifest.get('version') !== version) return undefined;
+      return manifest.get(field);
+    },
+    classify: (message) => (message.includes('Response Code: 404') ? 'not-found' : 'failed'),
+  },
+};
+
+/** List the versions `spec` (`name` or `name@<tag>`) resolves to on the registry */
+async function queryVersions(
+  spec: string,
+  registry: string | undefined,
+  manager: PublishManager,
+): Promise<string[] | LookupFailure> {
+  const reader = REGISTRY_READERS[manager];
   let raw: string;
   try {
-    raw = await runArgsAsync(args);
+    raw = await runArgsAsync(reader.versionsArgs(spec, registry));
   } catch (err) {
-    return /\bE404\b/.test(err instanceof Error ? err.message : String(err)) ? 'not-found' : 'failed';
+    return reader.classify(err instanceof Error ? err.message : String(err));
   }
   if (!raw.trim()) return 'empty';
   try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) return parsed.filter((v) => typeof v === 'string');
-    if (typeof parsed === 'string') return [parsed]; // single-version packages
+    const versions = reader.extract(JSON.parse(raw), 'versions');
+    if (Array.isArray(versions)) return versions.filter((v) => typeof v === 'string');
+    if (typeof versions === 'string') return [versions]; // single-version packages
     return 'failed';
   } catch {
     return 'failed';
@@ -99,44 +161,56 @@ async function queryVersions(name: string, registry?: string, tag?: string): Pro
  */
 export async function fetchPublishedVersions(
   name: string,
-  opts: { registry?: string; tag?: string } = {},
+  opts: { registry?: string; tag?: string; manager?: PublishManager } = {},
 ): Promise<PublishedVersions> {
-  const viaLatest = await queryVersions(name, opts.registry);
+  const manager = opts.manager ?? 'npm';
+  const viaLatest = await queryVersions(name, opts.registry, manager);
   if (Array.isArray(viaLatest)) return { versions: viaLatest, unresolved: false };
   // Package doesn't exist yet (first publish ever)
   if (viaLatest === 'not-found') return { versions: [], unresolved: false };
   if (viaLatest === 'failed') return { versions: [], unresolved: 'lookup-failed' };
 
   if (opts.tag && opts.tag !== 'latest') {
-    const viaTag = await queryVersions(name, opts.registry, opts.tag);
+    const viaTag = await queryVersions(`${name}@${opts.tag}`, opts.registry, manager);
     if (Array.isArray(viaTag)) return { versions: viaTag, unresolved: false };
     if (viaTag === 'failed') return { versions: [], unresolved: 'lookup-failed' };
   }
   return { versions: [], unresolved: 'no-dist-tag' };
 }
 
-/** Whether an exact version of a package is on the registry (no dist-tag resolution involved) */
-export async function isVersionOnRegistry(name: string, version: string, registry?: string): Promise<boolean> {
-  const args = ['npm', 'info', `${name}@${version}`, 'version'];
-  if (registry) args.push('--registry', registry);
+/** Read one field of an exact published version; `undefined` when the version or field isn't there */
+async function readExactField(
+  name: string,
+  version: string,
+  field: ExactField,
+  opts: { registry?: string; manager?: PublishManager },
+): Promise<unknown> {
+  const reader = REGISTRY_READERS[opts.manager ?? 'npm'];
   try {
-    return (await runArgsAsync(args)).trim() === version;
+    const raw = await runArgsAsync(reader.fieldArgs(`${name}@${version}`, field, opts.registry));
+    return raw.trim() ? reader.extract(JSON.parse(raw), field, version) : undefined;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
+/** Whether an exact version of a package is on the registry (no dist-tag resolution involved) */
+export async function isVersionOnRegistry(
+  name: string,
+  version: string,
+  opts: { registry?: string; manager?: PublishManager } = {},
+): Promise<boolean> {
+  return (await readExactField(name, version, 'version', opts)) === version;
+}
+
 /** Fetch the gitHead recorded for a published version (set by npm publish from a git checkout) */
-async function fetchGitHead(name: string, version: string, registry?: string): Promise<string | null> {
-  const args = ['npm', 'info', `${name}@${version}`, 'gitHead'];
-  if (registry) args.push('--registry', registry);
-  try {
-    const result = await runArgsAsync(args);
-    const sha = result.trim();
-    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
-  } catch {
-    return null;
-  }
+async function fetchGitHead(
+  name: string,
+  version: string,
+  opts: { registry?: string; manager?: PublishManager } = {},
+): Promise<string | null> {
+  const sha = await readExactField(name, version, 'gitHead', opts);
+  return typeof sha === 'string' && /^[0-9a-f]{40}$/.test(sha) ? sha : null;
 }
 
 /** Whether a package publishes through the npm registry (vs custom command / git-tag tracking) */
@@ -151,11 +225,13 @@ export async function getPublishedPrereleaseState(
   preid: string,
   rootDir: string,
   distTag?: string,
+  manager?: PublishManager,
 ): Promise<PublishedPrereleaseState> {
   if (usesNpmRegistry(pkg)) {
     const { versions, unresolved } = await fetchPublishedVersions(pkg.name, {
       registry: pkg.bumpy?.registry,
       tag: distTag,
+      manager,
     });
     return {
       counters: extractPrereleaseCounters(versions, target, preid),
@@ -203,6 +279,7 @@ export async function buildChannelReleasePlan(
      * the registry wins at actual publish time.
      */
     forDisplay?: boolean;
+    publishManager?: PublishManager;
   } = {},
 ): Promise<ChannelReleasePlanResult> {
   const headSha = tryRunArgs(['git', 'rev-parse', 'HEAD'], { cwd: rootDir });
@@ -218,7 +295,14 @@ export async function buildChannelReleasePlan(
       if (pkg.private && !pkg.bumpy?.publishCommand) return;
 
       const target = release.newVersion; // stable target from the bump files
-      const state = await getPublishedPrereleaseState(pkg, target, channel.preid, rootDir, channel.tag);
+      const state = await getPublishedPrereleaseState(
+        pkg,
+        target,
+        channel.preid,
+        rootDir,
+        channel.tag,
+        opts.publishManager,
+      );
 
       if (state.unresolved) {
         const reason =
@@ -241,7 +325,8 @@ export async function buildChannelReleasePlan(
       if (!opts.forDisplay && state.counters.length > 0 && headSha) {
         const latest = `${target}-${channel.preid}.${Math.max(...state.counters)}`;
         const publishedFromHead = usesNpmRegistry(pkg)
-          ? (await fetchGitHead(pkg.name, latest, pkg.bumpy?.registry)) === headSha
+          ? (await fetchGitHead(pkg.name, latest, { registry: pkg.bumpy?.registry, manager: opts.publishManager })) ===
+            headSha
           : tryRunArgs(['git', 'rev-parse', `refs/tags/${pkg.name}@${latest}`], { cwd: rootDir }) === headSha;
         if (publishedFromHead) {
           alreadyPublished.push({ name: release.name, version: latest });

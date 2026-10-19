@@ -8,7 +8,12 @@ import { publishPackages, willUseOidcExclusively } from '../core/publish-pipelin
 import { readBumpFiles } from '../core/bump-file.ts';
 import { assembleReleasePlan } from '../core/release-plan.ts';
 import { channelNames, resolveActiveChannel, type ResolvedChannel } from '../core/channels.ts';
-import { buildChannelReleasePlan, writeTransientVersionsInPlace } from '../core/prerelease.ts';
+import {
+  buildChannelReleasePlan,
+  isVersionOnRegistry,
+  writeTransientVersionsInPlace,
+  type PublishManager,
+} from '../core/prerelease.ts';
 import {
   buildSnapshotReleasePlan,
   resolveSnapshot,
@@ -201,7 +206,9 @@ async function publishChannel(
   const stablePlan = assembleReleasePlan(bumpFiles, packages, depGraph, config, {
     prereleasePreid: channel.preid,
   });
-  const { plan, alreadyPublished, warnings } = await buildChannelReleasePlan(stablePlan, channel, packages, rootDir);
+  const { plan, alreadyPublished, warnings } = await buildChannelReleasePlan(stablePlan, channel, packages, rootDir, {
+    publishManager: config.publish.publishManager,
+  });
 
   for (const w of warnings) log.warn(w);
   for (const skip of alreadyPublished) {
@@ -297,7 +304,9 @@ async function publishSnapshot(
 
   log.bold(`Snapshot "${snapshot.name}" — dist-tag @${snapshot.tag} (strategy: ${snapshot.strategy})\n`);
 
-  const { plan, alreadyPublished, warnings } = await buildSnapshotReleasePlan(stablePlan, snapshot, packages);
+  const { plan, alreadyPublished, warnings } = await buildSnapshotReleasePlan(stablePlan, snapshot, packages, {
+    publishManager: config.publish.publishManager,
+  });
   for (const w of warnings) log.warn(w);
   for (const skip of alreadyPublished) {
     log.dim(`  Skipping ${skip.name}@${skip.version} — this snapshot was already published`);
@@ -762,11 +771,11 @@ async function findUnpublishedWithCache(
  * Detection strategy (per package):
  * 1. Custom `checkPublished` command → run it, compare output to current version
  * 2. `skipNpmPublish` or custom `publishCommand` → check git tags
- * 3. Default → check npm registry via `npm info`
+ * 3. Default → check the registry with the publish manager
  */
 export async function findUnpublishedPackages(
   packages: Map<string, WorkspacePackage>,
-  _config: BumpyConfig,
+  config: BumpyConfig,
 ): Promise<PlannedRelease[]> {
   const unpublished: PlannedRelease[] = [];
 
@@ -776,7 +785,7 @@ export async function findUnpublishedPackages(
     // Skip ignored
     if (pkg.version === '0.0.0') continue;
 
-    const isPublished = await checkIfPublished(name, pkg.version, pkg.bumpy);
+    const isPublished = await checkIfPublished(name, pkg.version, config.publish.publishManager, pkg.bumpy);
     if (!isPublished) {
       unpublished.push({
         name,
@@ -795,8 +804,13 @@ export async function findUnpublishedPackages(
   return unpublished;
 }
 
-async function checkIfPublished(name: string, version: string, pkgConfig?: PackageConfig): Promise<boolean> {
-  const { runAsync, runArgsAsync, tryRunArgs } = await import('../utils/shell.ts');
+async function checkIfPublished(
+  name: string,
+  version: string,
+  manager: PublishManager,
+  pkgConfig?: PackageConfig,
+): Promise<boolean> {
+  const { runAsync, tryRunArgs } = await import('../utils/shell.ts');
 
   // 1. Custom check command (user-defined, runs in shell by design)
   if (pkgConfig?.checkPublished) {
@@ -814,15 +828,8 @@ async function checkIfPublished(name: string, version: string, pkgConfig?: Packa
     return tryRunArgs(['git', 'tag', '-l', tag]) === tag;
   }
 
-  // 3. Default — check npm registry
-  try {
-    const args = ['npm', 'info', `${name}@${version}`, 'version'];
-    if (pkgConfig?.registry) args.push('--registry', pkgConfig.registry);
-    const result = await runArgsAsync(args);
-    return result === version;
-  } catch {
-    return false;
-  }
+  // 3. Default — check the registry
+  return isVersionOnRegistry(name, version, { registry: pkgConfig?.registry, manager });
 }
 
 /**
