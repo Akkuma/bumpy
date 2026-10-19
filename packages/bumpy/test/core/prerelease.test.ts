@@ -9,6 +9,7 @@ import {
   channelDisplayPlan,
   fetchPublishedVersions,
   isVersionOnRegistry,
+  packageExistsOnRegistry,
   buildChannelReleasePlan,
 } from '../../src/core/prerelease.ts';
 import { makePkg, makeRelease, makeReleasePlan, createTempGitRepo, cleanupTempDir } from '../helpers.ts';
@@ -255,6 +256,79 @@ describe('registry version lookup', () => {
     addMockRule({ match: 'npm info pkg@1.0.0-pr-2-abc version --json', error: 'E404' });
     expect(await isVersionOnRegistry('pkg', '1.0.0-pr-1-abc')).toBe(true);
     expect(await isVersionOnRegistry('pkg', '1.0.0-pr-2-abc')).toBe(false);
+  });
+
+  // Trusted publishing (OIDC) can't create a package, so `bumpy publish` checks for it first
+  test.each([
+    {
+      manager: 'npm' as const,
+      state: 'published',
+      rule: { match: /^npm info pkg versions --json$/, response: '["1.0.0"]' },
+      exists: true,
+    },
+    { manager: 'npm' as const, state: 'without `latest`', rule: NO_LATEST, exists: true },
+    {
+      manager: 'npm' as const,
+      state: 'missing',
+      rule: { match: /^npm info pkg versions --json$/, error: 'npm error code E404\nnpm error 404 Not Found' },
+      exists: false,
+    },
+    {
+      manager: 'pnpm' as const,
+      state: 'without `latest`',
+      rule: {
+        match: /^pnpm view pkg versions --json$/,
+        error: '{"error":{"code":"ERR_PNPM_PACKAGE_NOT_FOUND","message":"No matching version found for pkg@latest"}}',
+      },
+      exists: true,
+    },
+    {
+      manager: 'pnpm' as const,
+      state: 'missing',
+      rule: {
+        match: /^pnpm view pkg versions --json$/,
+        error: '{"error":{"code":"ERR_PNPM_FETCH_404","message":"GET https://r/pkg: Not Found - 404"}}',
+      },
+      exists: false,
+    },
+    {
+      manager: 'bun' as const,
+      state: 'without `latest`',
+      rule: {
+        match: /^bun info pkg versions --json$/,
+        error: '{ "error": "No matching version found", "version": "pkg" }',
+      },
+      exists: true,
+    },
+    {
+      manager: 'bun' as const,
+      state: 'missing',
+      rule: {
+        match: /^bun info pkg versions --json$/,
+        error: "404 Not Found: https://r/pkg\n - 'pkg@latest' does not exist",
+      },
+      exists: false,
+    },
+    {
+      manager: 'yarn' as const,
+      state: 'published',
+      rule: { match: /^yarn npm info pkg --fields versions --json$/, response: '{"name":"pkg","versions":["1.0.0"]}' },
+      exists: true,
+    },
+    {
+      manager: 'yarn' as const,
+      state: 'missing',
+      rule: {
+        match: /^yarn npm info pkg --fields versions --json$/,
+        error: '{"type":"error","name":35,"displayName":"YN0035","data":"  Response Code: 404 (Not Found)"}',
+      },
+      exists: false,
+    },
+  ])('$manager: packageExistsOnRegistry is $exists when $state', async ({ manager, rule, exists }) => {
+    addMockRule(rule);
+    addMockRule({ match: /^(npm|pnpm|bun|yarn) /, error: 'unexpected registry command' });
+    expect(await packageExistsOnRegistry('pkg', { manager })).toBe(exists);
+    expect(getCallsMatching(rule.match)).toHaveLength(1);
   });
 
   describe('buildChannelReleasePlan', () => {
