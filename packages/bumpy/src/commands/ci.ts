@@ -1345,7 +1345,10 @@ async function ciChannelPlan(
       prereleasePreid: channel.preid,
     });
     try {
-      const built = await buildChannelReleasePlan(stablePlan, channel, packages, rootDir, { forDisplay: true });
+      const built = await buildChannelReleasePlan(stablePlan, channel, packages, rootDir, {
+        forDisplay: true,
+        publishManager: config.publish.publishManager,
+      });
       releases = built.plan.releases;
     } catch {
       releases = stablePlan.releases.map((r) => ({ ...r, newVersion: `${r.newVersion}-${channel.preid}.?` }));

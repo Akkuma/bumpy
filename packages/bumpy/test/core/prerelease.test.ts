@@ -9,10 +9,12 @@ import {
   channelDisplayPlan,
   fetchPublishedVersions,
   isVersionOnRegistry,
+  packageExistsOnRegistry,
   buildChannelReleasePlan,
 } from '../../src/core/prerelease.ts';
 import { makePkg, makeRelease, makeReleasePlan, createTempGitRepo, cleanupTempDir } from '../helpers.ts';
 import { resetMockState, uninstallShellMock, addMockRule, getCallsMatching } from '../helpers-shell-mock.ts';
+import { tryRunArgs } from '../../src/utils/shell.ts';
 
 describe('extractPrereleaseCounters', () => {
   test('extracts counters for matching target + preid only', () => {
@@ -172,6 +174,15 @@ describe('channelDisplayPlan', () => {
 // `latest` and prints nothing (exit 0) in that case — see issue #163.
 describe('registry version lookup', () => {
   const NO_LATEST = { match: /^npm info pkg versions --json$/, response: '' };
+  const channel = {
+    name: 'alpha',
+    branch: 'alpha',
+    preid: 'alpha',
+    tag: 'alpha',
+    versionPr: { title: 'Versioned prerelease (alpha)', branch: 'bumpy/release-alpha', automerge: false },
+  };
+  const plan = makeReleasePlan([makeRelease('pkg', '0.1.0', { oldVersion: '0.0.0' })]);
+  const packages = new Map([['pkg', makePkg('pkg', '0.0.0')]]);
 
   beforeEach(() => resetMockState());
   afterAll(() => uninstallShellMock());
@@ -182,12 +193,12 @@ describe('registry version lookup', () => {
       versions: ['1.0.0', '1.1.0-rc.0'],
       unresolved: false,
     });
-    expect(getCallsMatching('--tag')).toHaveLength(0);
+    expect(getCallsMatching('pkg@next')).toHaveLength(0);
   });
 
   test('falls back to the dist-tag hint when there is no `latest`', async () => {
     addMockRule(NO_LATEST);
-    addMockRule({ match: 'npm info pkg versions --json --tag alpha', response: '["0.1.0-alpha.0"]' });
+    addMockRule({ match: 'npm info pkg@alpha versions --json', response: '["0.1.0-alpha.0"]' });
     expect(await fetchPublishedVersions('pkg', { tag: 'alpha' })).toEqual({
       versions: ['0.1.0-alpha.0'],
       unresolved: false,
@@ -196,14 +207,20 @@ describe('registry version lookup', () => {
 
   test('passes the registry through to both lookups', async () => {
     addMockRule({ match: /^npm info pkg versions --json --registry https:\/\/r\.example$/, response: '' });
-    addMockRule({ match: '--tag alpha --registry https://r.example', response: '"0.1.0-alpha.0"' });
+    addMockRule({
+      match: 'npm info pkg@alpha versions --json --registry https://r.example',
+      response: '"0.1.0-alpha.0"',
+    });
     const result = await fetchPublishedVersions('pkg', { registry: 'https://r.example', tag: 'alpha' });
     expect(result.versions).toEqual(['0.1.0-alpha.0']);
   });
 
   test('flags unresolved when neither `latest` nor the hint resolve', async () => {
     addMockRule(NO_LATEST);
-    addMockRule({ match: '--tag alpha', error: 'npm error code E404\nNo match found for version alpha' });
+    addMockRule({
+      match: 'npm info pkg@alpha versions --json',
+      error: 'npm error code E404\nNo match found for version alpha',
+    });
     expect(await fetchPublishedVersions('pkg', { tag: 'alpha' })).toEqual({ versions: [], unresolved: 'no-dist-tag' });
     resetMockState();
     addMockRule(NO_LATEST);
@@ -227,7 +244,7 @@ describe('registry version lookup', () => {
     // the dist-tag fallback failing for a non-404 reason is a lookup failure too
     resetMockState();
     addMockRule(NO_LATEST);
-    addMockRule({ match: '--tag alpha', error: 'npm error code ETIMEDOUT' });
+    addMockRule({ match: 'npm info pkg@alpha versions --json', error: 'npm error code ETIMEDOUT' });
     expect(await fetchPublishedVersions('pkg', { tag: 'alpha' })).toEqual({
       versions: [],
       unresolved: 'lookup-failed',
@@ -235,26 +252,89 @@ describe('registry version lookup', () => {
   });
 
   test('isVersionOnRegistry checks the exact version', async () => {
-    addMockRule({ match: 'npm info pkg@1.0.0-pr-1-abc version', response: '1.0.0-pr-1-abc' });
-    addMockRule({ match: 'npm info pkg@1.0.0-pr-2-abc version', error: 'E404' });
+    addMockRule({ match: 'npm info pkg@1.0.0-pr-1-abc version --json', response: '"1.0.0-pr-1-abc"' });
+    addMockRule({ match: 'npm info pkg@1.0.0-pr-2-abc version --json', error: 'E404' });
     expect(await isVersionOnRegistry('pkg', '1.0.0-pr-1-abc')).toBe(true);
     expect(await isVersionOnRegistry('pkg', '1.0.0-pr-2-abc')).toBe(false);
   });
 
-  describe('buildChannelReleasePlan', () => {
-    const channel = {
-      name: 'alpha',
-      branch: 'alpha',
-      preid: 'alpha',
-      tag: 'alpha',
-      versionPr: { title: 'Versioned prerelease (alpha)', branch: 'bumpy/release-alpha', automerge: false },
-    };
-    const plan = makeReleasePlan([makeRelease('pkg', '0.1.0', { oldVersion: '0.0.0' })]);
-    const packages = new Map([['pkg', makePkg('pkg', '0.0.0')]]);
+  // Trusted publishing (OIDC) can't create a package, so `bumpy publish` checks for it first
+  test.each([
+    {
+      manager: 'npm' as const,
+      state: 'published',
+      rule: { match: /^npm info pkg versions --json$/, response: '["1.0.0"]' },
+      exists: true,
+    },
+    { manager: 'npm' as const, state: 'without `latest`', rule: NO_LATEST, exists: true },
+    {
+      manager: 'npm' as const,
+      state: 'missing',
+      rule: { match: /^npm info pkg versions --json$/, error: 'npm error code E404\nnpm error 404 Not Found' },
+      exists: false,
+    },
+    {
+      manager: 'pnpm' as const,
+      state: 'without `latest`',
+      rule: {
+        match: /^pnpm view pkg versions --json$/,
+        error: '{"error":{"code":"ERR_PNPM_PACKAGE_NOT_FOUND","message":"No matching version found for pkg@latest"}}',
+      },
+      exists: true,
+    },
+    {
+      manager: 'pnpm' as const,
+      state: 'missing',
+      rule: {
+        match: /^pnpm view pkg versions --json$/,
+        error: '{"error":{"code":"ERR_PNPM_FETCH_404","message":"GET https://r/pkg: Not Found - 404"}}',
+      },
+      exists: false,
+    },
+    {
+      manager: 'bun' as const,
+      state: 'without `latest`',
+      rule: {
+        match: /^bun info pkg versions --json$/,
+        error: '{ "error": "No matching version found", "version": "pkg" }',
+      },
+      exists: true,
+    },
+    {
+      manager: 'bun' as const,
+      state: 'missing',
+      rule: {
+        match: /^bun info pkg versions --json$/,
+        error: "404 Not Found: https://r/pkg\n - 'pkg@latest' does not exist",
+      },
+      exists: false,
+    },
+    {
+      manager: 'yarn' as const,
+      state: 'published',
+      rule: { match: /^yarn npm info pkg --fields versions --json$/, response: '{"name":"pkg","versions":["1.0.0"]}' },
+      exists: true,
+    },
+    {
+      manager: 'yarn' as const,
+      state: 'missing',
+      rule: {
+        match: /^yarn npm info pkg --fields versions --json$/,
+        error: '{"type":"error","name":35,"displayName":"YN0035","data":"  Response Code: 404 (Not Found)"}',
+      },
+      exists: false,
+    },
+  ])('$manager: packageExistsOnRegistry is $exists when $state', async ({ manager, rule, exists }) => {
+    addMockRule({ match: /^(npm|pnpm|bun|yarn) /, error: 'unexpected registry command' });
+    addMockRule(rule);
+    expect(await packageExistsOnRegistry('pkg', { manager })).toBe(exists);
+    expect(getCallsMatching(rule.match)).toHaveLength(1);
+  });
 
+  describe('buildChannelReleasePlan', () => {
     test('counts prereleases on a registry without `latest`', async () => {
       addMockRule(NO_LATEST);
-      addMockRule({ match: '--tag alpha', response: '["0.1.0-alpha.0","0.1.0-alpha.1"]' });
+      addMockRule({ match: 'npm info pkg@alpha versions --json', response: '["0.1.0-alpha.0","0.1.0-alpha.1"]' });
       const { plan: out, warnings } = await buildChannelReleasePlan(plan, channel, packages, process.cwd(), {
         forDisplay: true,
       });
@@ -264,7 +344,10 @@ describe('registry version lookup', () => {
 
     test('warns when the version list cannot be read', async () => {
       addMockRule(NO_LATEST);
-      addMockRule({ match: '--tag alpha', error: 'npm error code E404\nNo match found for version alpha' });
+      addMockRule({
+        match: 'npm info pkg@alpha versions --json',
+        error: 'npm error code E404\nNo match found for version alpha',
+      });
       const { plan: out, warnings } = await buildChannelReleasePlan(plan, channel, packages, process.cwd(), {
         forDisplay: true,
       });
@@ -278,6 +361,152 @@ describe('registry version lookup', () => {
       const { warnings } = await buildChannelReleasePlan(plan, channel, packages, process.cwd(), { forDisplay: true });
       expect(warnings).toHaveLength(1);
       expect(warnings[0]).toContain('could not be looked up on the registry');
+    });
+  });
+
+  // The lookups run with `publish.publishManager`, so the registry is read with the same client
+  // (and the same auth config) that publishes. Responses below are what each CLI printed against
+  // a registry whose package only has an `alpha` dist-tag.
+  describe('with another publish manager', () => {
+    const NPM_FORBIDDEN = { match: /^npm /, error: 'npm must not run when publishManager is not npm' };
+
+    const noLatest = [
+      {
+        manager: 'pnpm' as const,
+        rules: [
+          {
+            match: /^pnpm view pkg versions --json$/,
+            error:
+              '{"error":{"code":"ERR_PNPM_PACKAGE_NOT_FOUND","message":"No matching version found for pkg@latest"}}',
+          },
+          { match: /^pnpm view pkg@alpha versions --json$/, response: '["0.1.0-alpha.0","0.1.0-alpha.1"]' },
+        ],
+      },
+      {
+        manager: 'bun' as const,
+        rules: [
+          {
+            match: /^bun info pkg versions --json$/,
+            error: '{ "error": "No matching version found", "version": "pkg" }',
+          },
+          { match: /^bun info pkg@alpha versions --json$/, response: '["0.1.0-alpha.0","0.1.0-alpha.1"]' },
+        ],
+      },
+      {
+        manager: 'yarn' as const,
+        rules: [
+          {
+            match: /^yarn npm info pkg --fields versions --json$/,
+            response: '{"name":"pkg","versions":["0.1.0-alpha.0","0.1.0-alpha.1"]}',
+          },
+        ],
+      },
+    ];
+
+    test.each(noLatest)('$manager: counts prereleases on a registry without `latest`', async ({ manager, rules }) => {
+      addMockRule(NPM_FORBIDDEN);
+      for (const rule of rules) addMockRule(rule);
+      const { plan: out, warnings } = await buildChannelReleasePlan(plan, channel, packages, process.cwd(), {
+        forDisplay: true,
+        publishManager: manager,
+      });
+      expect(out.releases[0]!.newVersion).toBe('0.1.0-alpha.2');
+      expect(warnings).toEqual([]);
+      expect(getCallsMatching(/^npm /)).toHaveLength(0);
+    });
+
+    const missingPackage = [
+      {
+        manager: 'pnpm' as const,
+        error: '{"error":{"code":"ERR_PNPM_FETCH_404","message":"GET https://r/pkg: Not Found - 404"}}',
+      },
+      {
+        manager: 'bun' as const,
+        error: "404 Not Found: https://r/pkg\n - 'pkg@latest' does not exist in this registry",
+      },
+      {
+        manager: 'yarn' as const,
+        error: '{"type":"error","name":35,"displayName":"YN0035","data":"  Response Code: 404 (Not Found)"}',
+      },
+    ];
+
+    test.each(missingPackage)('$manager: a missing package is not unresolved', async ({ manager, error }) => {
+      addMockRule(NPM_FORBIDDEN);
+      addMockRule({ match: /versions/, error });
+      expect(await fetchPublishedVersions('pkg', { tag: 'alpha', manager })).toEqual({
+        versions: [],
+        unresolved: false,
+      });
+    });
+
+    test('pnpm: a non-404 failure is lookup-failed', async () => {
+      addMockRule(NPM_FORBIDDEN);
+      addMockRule({
+        match: /versions/,
+        error: '{"error":{"code":"ERR_PNPM_FETCH_401","message":"Unauthorized - 401"}}',
+      });
+      expect(await fetchPublishedVersions('pkg', { tag: 'alpha', manager: 'pnpm' })).toEqual({
+        versions: [],
+        unresolved: 'lookup-failed',
+      });
+      expect(getCallsMatching(/^pnpm view pkg versions/)).toHaveLength(1);
+    });
+
+    // yarn answers a spec that matches nothing with the newest manifest instead of failing
+    test('yarn: an exact-version check rejects the manifest yarn substitutes', async () => {
+      addMockRule(NPM_FORBIDDEN);
+      addMockRule({
+        match: /^yarn npm info pkg@1\.0\.0 --fields version --json$/,
+        response: '{"name":"pkg","version":"1.0.0"}',
+      });
+      addMockRule({
+        match: /^yarn npm info pkg@9\.9\.9 --fields version --json$/,
+        response: '{"name":"pkg","version":"1.0.0"}',
+      });
+      expect(await isVersionOnRegistry('pkg', '1.0.0', { manager: 'yarn' })).toBe(true);
+      expect(await isVersionOnRegistry('pkg', '9.9.9', { manager: 'yarn' })).toBe(false);
+    });
+
+    test('pnpm: isVersionOnRegistry reads the exact version', async () => {
+      addMockRule(NPM_FORBIDDEN);
+      addMockRule({
+        match: /^pnpm view pkg@1\.0\.0 version --json --registry https:\/\/r\.example$/,
+        response: '"1.0.0"',
+      });
+      addMockRule({
+        match: /^pnpm view pkg@9\.9\.9 version --json/,
+        error: '{"error":{"code":"ERR_PNPM_PACKAGE_NOT_FOUND","message":"No matching version found for pkg@9.9.9"}}',
+      });
+      expect(await isVersionOnRegistry('pkg', '1.0.0', { registry: 'https://r.example', manager: 'pnpm' })).toBe(true);
+      expect(await isVersionOnRegistry('pkg', '9.9.9', { manager: 'pnpm' })).toBe(false);
+    });
+
+    describe('yarn: published-from-HEAD check', () => {
+      const head = tryRunArgs(['git', 'rev-parse', 'HEAD'])!;
+      const yarnRules = (gitHeadResponse: object) => {
+        addMockRule(NPM_FORBIDDEN);
+        addMockRule({
+          match: /^yarn npm info pkg --fields versions --json$/,
+          response: '{"name":"pkg","versions":["0.1.0-alpha.0","0.1.0-alpha.1"]}',
+        });
+        addMockRule({
+          match: /^yarn npm info pkg@0\.1\.0-alpha\.1 --fields version,gitHead --json$/,
+          response: JSON.stringify(gitHeadResponse),
+        });
+      };
+
+      test('gitHead of the requested version marks it already published', async () => {
+        yarnRules({ name: 'pkg', version: '0.1.0-alpha.1', gitHead: head });
+        const out = await buildChannelReleasePlan(plan, channel, packages, process.cwd(), { publishManager: 'yarn' });
+        expect(out.alreadyPublished).toEqual([{ name: 'pkg', version: '0.1.0-alpha.1' }]);
+      });
+
+      test('gitHead from a substituted manifest is ignored', async () => {
+        yarnRules({ name: 'pkg', version: '9.9.9', gitHead: head });
+        const out = await buildChannelReleasePlan(plan, channel, packages, process.cwd(), { publishManager: 'yarn' });
+        expect(out.alreadyPublished).toEqual([]);
+        expect(out.plan.releases[0]!.newVersion).toBe('0.1.0-alpha.2');
+      });
     });
   });
 });

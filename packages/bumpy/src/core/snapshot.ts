@@ -1,7 +1,7 @@
 import { isPrerelease } from 'verkit';
 import { tryRunArgs } from '../utils/shell.ts';
 import { isVersionOnRegistry, usesNpmRegistry } from './prerelease.ts';
-import type { BumpyConfig, ReleasePlan, PlannedRelease, WorkspacePackage } from '../types.ts';
+import type { BumpyConfig, PackageManager, ReleasePlan, PlannedRelease, WorkspacePackage } from '../types.ts';
 
 /**
  * Snapshot releases publish the pending release plan transiently — a throwaway
@@ -118,6 +118,7 @@ export async function buildSnapshotReleasePlan(
   stablePlan: ReleasePlan,
   snapshot: ResolvedSnapshot,
   packages: Map<string, WorkspacePackage>,
+  opts: { publishManager?: PackageManager } = {},
 ): Promise<SnapshotReleasePlanResult> {
   const warnings = [...stablePlan.warnings];
   const alreadyPublished: Array<{ name: string; version: string }> = [];
@@ -137,7 +138,9 @@ export async function buildSnapshotReleasePlan(
       // already published this exact snapshot — skip to stay idempotent (re-run on the
       // same commit). Only registry-backed packages can be checked this way.
       if (usesNpmRegistry(pkg)) {
-        if (await isVersionOnRegistry(pkg.name, version, pkg.bumpy?.registry)) {
+        if (
+          await isVersionOnRegistry(pkg.name, version, { registry: pkg.bumpy?.registry, manager: opts.publishManager })
+        ) {
           alreadyPublished.push({ name: release.name, version });
           return;
         }

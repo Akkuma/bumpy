@@ -197,7 +197,10 @@ async function channelStatus(
   let releases = stablePlan.releases;
   let countersExact = false;
   try {
-    const built = await buildChannelReleasePlan(stablePlan, channel, packages, rootDir, { forDisplay: true });
+    const built = await buildChannelReleasePlan(stablePlan, channel, packages, rootDir, {
+      forDisplay: true,
+      publishManager: config.publish.publishManager,
+    });
     if (built.plan.releases.length > 0) {
       releases = built.plan.releases;
       countersExact = true;
